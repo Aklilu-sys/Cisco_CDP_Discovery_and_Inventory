@@ -1,0 +1,416 @@
+import pandas as pd
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException, NetmikoBaseException
+import getpass
+import re
+import datetime
+import sys
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from queue import Queue
+import time
+
+# --- Global Locks for Console Output ---
+console_lock = threading.Lock()
+
+# ==============================================================================
+# Credential and Connection Management
+# ==============================================================================
+
+def get_credential_pool():
+    """
+    Prompts the user for multiple sets of credentials and stores them in a list.
+    """
+    credential_pool = []
+    while True:
+        try:
+            num_credentials = int(input("How many credential sets do you want to provide?: "))
+            if num_credentials < 1:
+                print("Please enter a number greater than 0.")
+                continue
+            break
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+    for i in range(num_credentials):
+        print(f"\nCredential Set {i + 1}:")
+        username = input("Enter username: ")
+        password = getpass.getpass("Enter password: ")
+        credential_pool.append({'username': username, 'password': password})
+
+    return credential_pool
+
+def reconnect_and_retry(ip_address, creds_to_try, device_type):
+    """
+    Attempts to connect to a device using a given list of credentials.
+    Re-establishes a session if it fails after 3 attempts.
+    """
+    for i, cred in enumerate(creds_to_try):
+        username = cred['username']
+        password = cred['password']
+
+        try:
+            with console_lock:
+                print(f"Attempting to connect to {ip_address} using credential set {i + 1}...")
+            net_connect = ConnectHandler(
+                device_type=device_type,
+                host=ip_address,
+                username=username,
+                password=password,
+                timeout=10
+            )
+            with console_lock:
+                print(f"Connection successful to {ip_address} using credential set {i + 1}.")
+            return net_connect, "Success"
+        except NetmikoAuthenticationException:
+            with console_lock:
+                print(f"Authentication failed for {ip_address} with credential set {i + 1}.")
+            if (i + 1) % 3 == 0 and i + 1 < len(creds_to_try):
+                with console_lock:
+                    print(f"Failed 3 consecutive times. Checking session and retrying with next credential pool...")
+                time.sleep(1) # Wait to avoid hammering the device
+            continue # Try next credential without Telnet fallback
+        except NetmikoTimeoutException as e:
+            with console_lock:
+                print(f"Connection timed out for {ip_address}. Reason: {e}")
+            return None, "Timeout"
+        except NetmikoBaseException as e:
+            with console_lock:
+                print(f"Connection failed for {ip_address}. Reason: {e}")
+            return None, "Connection Failed"
+        except Exception as e:
+            with console_lock:
+                print(f"An unexpected error occurred with {ip_address}: {e}")
+            return None, "Unexpected Error"
+
+    return None, "Authentication Failed"
+
+# ==============================================================================
+# Reporting Functions
+# ==============================================================================
+
+def create_cdp_excel_report(data, filename):
+    """
+    Creates an Excel file from the list of CDP neighbors.
+    """
+    if not data:
+        with console_lock:
+            print("No CDP neighbors found to report.")
+        return
+        
+    try:
+        df = pd.DataFrame(data)
+        df.rename(columns={'Parent Device IP': 'Device IP', 'Management IP': 'Remote Device IP'}, inplace=True)
+        df = df[["Device ID", "Device IP", "Remote Device IP", "Local Intrfce", "Platform", "Remote Port", "Connection Result"]]
+        df.to_excel(filename, index=False)
+        with console_lock:
+            print(f"CDP neighbor report saved to {filename}")
+    except Exception as e:
+        with console_lock:
+            print(f"Error creating CDP Excel report: {e}")
+
+def create_inventory_excel_report(results, filename):
+    """
+    Creates an Excel file from the collected inventory results.
+    """
+    if not results:
+        with console_lock:
+            print("No inventory data found to report.")
+        return
+        
+    try:
+        df = pd.DataFrame(results)
+        headers = ["ip", "product_id", "serial_number", "status", "error"]
+        df = df[headers]
+        df.rename(columns={
+            'ip': 'Management IP', 
+            'product_id': 'Product ID', 
+            'serial_number': 'Serial Number',
+            'status': 'Connection Status',
+            'error': 'Error Message'
+        }, inplace=True)
+        df.to_excel(filename, index=False)
+        with console_lock:
+            print(f"\nInventory report saved to {filename}")
+    except Exception as e:
+        with console_lock:
+            print(f"\nError creating Inventory Excel report: {e}")
+            
+# ==============================================================================
+# CDP Discovery Functions
+# ==============================================================================
+
+def get_cdp_neighbors(ip_address, credential_pool):
+    """
+    Connects to the device using the credential pool and returns the output.
+    """
+    net_connect, status = reconnect_and_retry(ip_address, credential_pool, 'cisco_ios')
+    output = None
+    if status == "Success":
+        output = net_connect.send_command('show cdp neighbor detail')
+        net_connect.disconnect()
+        return output, "Success"
+    
+    # Fallback to Telnet if SSH failed for reasons other than authentication
+    if "Connection" in status or "Timeout" in status or "Unexpected" in status:
+        net_connect, telnet_status = reconnect_and_retry(ip_address, credential_pool, 'cisco_ios_telnet')
+        if telnet_status == "Success":
+            output = net_connect.send_command('show cdp neighbor detail')
+            net_connect.disconnect()
+            return output, "Success via Telnet"
+        return None, f"Failed via SSH ({status}) and Telnet ({telnet_status})"
+
+    return None, f"Failed: {status}"
+
+def parse_cdp_output(output, parent_ip, connection_result):
+    """
+    Parses the raw 'show cdp neighbor detail' output and adds the parent IP and connection result.
+    """
+    neighbors = []
+    
+    if output:
+        neighbor_blocks = re.split(r'-------------------------', output)
+        patterns = {
+            'Device ID': re.compile(r'Device ID: (.+)', re.IGNORECASE),
+            'Local Intrfce': re.compile(r'Interface: (.+?),', re.IGNORECASE),
+            'Platform': re.compile(r'Platform: (.+?),', re.IGNORECASE),
+            'Remote Port': re.compile(r'Port ID \(outgoing port\): (.+)', re.IGNORECASE),
+            'Management IP': re.compile(r'Entry address\(es\):\s*IP address: (\S+)', re.IGNORECASE | re.DOTALL),
+        }
+
+        for block in neighbor_blocks:
+            if "Device ID" in block:
+                neighbor = {'Parent Device IP': parent_ip, 'Connection Result': connection_result}
+                for key, pattern in patterns.items():
+                    match = pattern.search(block)
+                    if match:
+                        neighbor[key] = match.group(1).strip()
+                    else:
+                        neighbor[key] = "Not Found"
+                
+                if len(neighbor) == len(patterns) + 2:
+                    neighbors.append(neighbor)
+    
+    if not output:
+        failed_entry = {
+            'Device ID': f"Failed - {parent_ip}",
+            'Parent Device IP': parent_ip,
+            'Connection Result': connection_result,
+            'Local Intrfce': 'N/A',
+            'Platform': 'N/A',
+            'Remote Port': 'N/A',
+            'Management IP': 'N/A'
+        }
+        neighbors.append(failed_entry)
+        
+    return neighbors
+
+def cdp_worker(host_data, credential_pool, processed_ips_lock):
+    """
+    Worker function for each thread in CDP scanning.
+    """
+    ip = host_data['ip']
+    platform = host_data.get('platform', 'Unknown')
+
+    with processed_ips_lock:
+        if ip in processed_ips:
+            return []
+        
+        processed_ips.add(ip)
+        
+    output, result = get_cdp_neighbors(ip, credential_pool)
+    
+    results = parse_cdp_output(output, ip, result)
+    return results
+
+# ==============================================================================
+# Inventory Collection Functions
+# ==============================================================================
+
+def get_inventory_from_device(host, credential_pool):
+    """
+    Connects to a Cisco device, runs 'show inventory', and extracts PID/SN pairs,
+    using the credential pool.
+    """
+    base_result = {
+        'ip': host,
+        'status': 'Failure',
+        'error': ''
+    }
+    output = None
+    
+    net_connect, status = reconnect_and_retry(host, credential_pool, 'cisco_ios')
+    
+    if status == "Success":
+        try:
+            output = net_connect.send_command("show inventory")
+            base_result['status'] = 'Success (SSH)'
+        except Exception as e:
+            base_result['error'] = f"Command failed: {e}"
+        finally:
+            net_connect.disconnect()
+            
+    elif "Connection" in status or "Timeout" in status or "Unexpected" in status:
+        net_connect, telnet_status = reconnect_and_retry(host, credential_pool, 'cisco_ios_telnet')
+        if telnet_status == "Success":
+            try:
+                output = net_connect.send_command("show inventory")
+                base_result['status'] = 'Success (Telnet)'
+            except Exception as e:
+                base_result['error'] = f"Command failed: {e}"
+            finally:
+                net_connect.disconnect()
+        else:
+            base_result['error'] = f"Failed via SSH ({status}) and Telnet ({telnet_status})"
+    else:
+        base_result['error'] = f"Failed: {status}"
+
+    inventory_items = []
+    if output:
+        pid_sn_pairs = re.findall(r"PID:\s*(\S+).*?SN:\s*(\S+)", output, re.DOTALL)
+        if pid_sn_pairs:
+            for pid, sn in pid_sn_pairs:
+                item = {**base_result, 'product_id': pid.strip(), 'serial_number': sn.strip(), 'error': 'None'}
+                inventory_items.append(item)
+        else:
+            item = {**base_result, 'product_id': 'Not Found', 'serial_number': 'Not Found', 'error': 'No PID/SN found in output'}
+            inventory_items.append(item)
+    else:
+        item = {**base_result, 'product_id': 'N/A', 'serial_number': 'N/A', 'error': base_result['error']}
+        inventory_items.append(item)
+    
+    return inventory_items
+
+def inventory_worker(ip_address, credential_pool):
+    """
+    Worker function for each thread in inventory scanning.
+    """
+    return get_inventory_from_device(ip_address, credential_pool)
+
+# ==============================================================================
+# Main Script Execution
+# ==============================================================================
+
+if __name__ == '__main__':
+    initial_ip_for_cdp_scan = input("Enter the initial IP address to scan for CDP neighbors: ")
+    
+    if not initial_ip_for_cdp_scan:
+        print("Invalid input. Please provide an IP address.")
+        sys.exit()
+
+    num_iterations_str = input("How many CDP discovery iterations should the script try? (default: 2): ")
+    try:
+        num_iterations = int(num_iterations_str) if num_iterations_str else 2
+    except ValueError:
+        print("Invalid number of iterations. Defaulting to 2.")
+        num_iterations = 2
+    
+    all_cdp_neighbors = []
+    processed_ips = set()
+    processed_ips_lock = threading.Lock()
+    
+    # --- Phase 1: CDP Discovery ---
+    print("\n" + "="*50)
+    print("Starting CDP Neighbor Discovery Phase")
+    print("="*50)
+    
+    print("\n--- Starting Initial CDP Scan ---")
+    credential_pool = get_credential_pool()
+
+    initial_output, initial_result = get_cdp_neighbors(initial_ip_for_cdp_scan, credential_pool)
+    if initial_output:
+        initial_neighbors = parse_cdp_output(initial_output, initial_ip_for_cdp_scan, initial_result)
+        all_cdp_neighbors.extend(initial_neighbors)
+    else:
+        all_cdp_neighbors.extend(parse_cdp_output(None, initial_ip_for_cdp_scan, initial_result))
+    
+    processed_ips.add(initial_ip_for_cdp_scan)
+
+    for i in range(num_iterations):
+        with console_lock:
+            print(f"\n--- Starting CDP Loop {i+1} Scan on Discovered Neighbors ---")
+        
+        hosts_to_scan_for_cdp = []
+        
+        potential_next_hops = set()
+        
+        for neighbor_entry in all_cdp_neighbors:
+            parent_ip = neighbor_entry.get('Parent Device IP')
+            remote_ip = neighbor_entry.get('Management IP')
+            remote_platform = neighbor_entry.get('Platform', 'Unknown')
+            
+            if parent_ip and parent_ip not in processed_ips and "Success" in neighbor_entry.get('Connection Result', ''):
+                potential_next_hops.add((parent_ip, "Unknown"))
+            
+            if remote_ip and remote_ip != 'Not Found' and remote_ip not in processed_ips:
+                if "cisco" in str(remote_platform).lower() and "cisco AIR" not in str(remote_platform) and "cisco C9120" not in str(remote_platform):
+                    potential_next_hops.add((remote_ip, remote_platform))
+        
+        for ip, platform in potential_next_hops:
+            hosts_to_scan_for_cdp.append({'ip': ip, 'platform': platform})
+
+        if not hosts_to_scan_for_cdp:
+            with console_lock:
+                print("No new valid management IPs found to scan for CDP. Ending loop.")
+            break
+            
+        with console_lock:
+            print(f"Found {len(hosts_to_scan_for_cdp)} new neighbors to check for CDP.")
+        
+        new_cdp_neighbors = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_results = [
+                executor.submit(cdp_worker, host, credential_pool, processed_ips_lock)
+                for host in hosts_to_scan_for_cdp
+            ]
+            for future in future_results:
+                new_cdp_neighbors.extend(future.result())
+        
+        all_cdp_neighbors.extend(new_cdp_neighbors)
+    
+    final_cdp_neighbors = {}
+    for neighbor in all_cdp_neighbors:
+        key = (neighbor.get('Device ID'), neighbor.get('Parent Device IP'))
+        final_cdp_neighbors[key] = neighbor
+    
+    timestamp_cdp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename_cdp = f"cdp_neighbors_{initial_ip_for_cdp_scan}_{timestamp_cdp}.xlsx"
+    create_cdp_excel_report(list(final_cdp_neighbors.values()), filename_cdp)
+
+    # --- Phase 2: Inventory Collection Prompt ---
+    get_inventory_response = input("\nDo you want to get inventory information from discovered devices? (yes/no): ").lower()
+
+    if get_inventory_response == 'yes':
+        print("\n" + "="*50)
+        print("Starting Inventory Collection Phase")
+        print("="*50)
+
+        inventory_ips_to_scan = set()
+        
+        for neighbor in final_cdp_neighbors.values():
+            parent_ip = neighbor.get('Parent Device IP')
+            if parent_ip and "Success" in neighbor['Connection Result']:
+                inventory_ips_to_scan.add(parent_ip)
+
+        if not inventory_ips_to_scan:
+            print("No valid Cisco device IPs discovered for inventory collection.")
+        else:
+            inventory_results = []
+            with console_lock:
+                print(f"Starting inventory scan on {len(inventory_ips_to_scan)} devices using the credential pool.")
+            
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [
+                    executor.submit(inventory_worker, ip, credential_pool)
+                    for ip in inventory_ips_to_scan
+                ]
+                for future in futures:
+                    inventory_results.extend(future.result())
+
+            timestamp_inv = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            filename_inv = f"network_inventory_report_{initial_ip_for_cdp_scan}_{timestamp_inv}.xlsx"
+            create_inventory_excel_report(inventory_results, filename_inv)
+    else:
+        print("Inventory collection skipped.")
+
+    print("\nScript execution finished.")
