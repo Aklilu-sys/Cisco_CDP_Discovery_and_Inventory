@@ -1,186 +1,293 @@
 import pandas as pd
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException, NetmikoBaseException
-import getpass
+from netmiko import ConnectHandler, BaseConnection
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException, NetmikoBaseException, ReadTimeout
 import re
 import datetime
 import sys
 from concurrent.futures import ThreadPoolExecutor
 import threading
-from queue import Queue
 import time
+import getpass
+import os
 
-# --- Global Locks for Console Output ---
+# --- Global Locks for Console Output and Logging ---
 console_lock = threading.Lock()
+log_file = None
+
+def log_message(message, timestamp=True):
+    """
+    Logs a message to both the console and a file.
+    """
+    with console_lock:
+        timestamp_str = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] " if timestamp else ""
+        full_message = f"{timestamp_str}{message}"
+        print(full_message)
+        if log_file:
+            log_file.write(full_message + '\n')
 
 # ==============================================================================
 # Credential and Connection Management
 # ==============================================================================
 
-def get_credential_pool():
+def get_credential_pool_from_file():
     """
-    Prompts the user for multiple sets of credentials and stores them in a list.
+    Looks for a file named "Creds.txt" in the same directory as the script
+    and reads multiple sets of credentials based on labels from it.
+    Returns a dictionary of credential lists keyed by the label.
     """
-    credential_pool = []
-    while True:
-        try:
-            num_credentials = int(input("How many credential sets do you want to provide?: "))
-            if num_credentials < 1:
-                print("Please enter a number greater than 0.")
-                continue
-            break
-        except ValueError:
-            print("Invalid input. Please enter a number.")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(script_dir, "Creds.txt")
+    
+    credential_groups = {}
+    ip_specific_creds = {}
+    current_label = 'default'
+    credential_groups[current_label] = []
 
-    for i in range(num_credentials):
-        print(f"\nCredential Set {i + 1}:")
-        username = input("Enter username: ")
-        password = getpass.getpass("Enter password: ")
-        credential_pool.append({'username': username, 'password': password})
+    try:
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+            
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
+                
+                # Skip blank lines and comments
+                if not line or line.startswith('#'):
+                    i += 1
+                    continue
 
-    return credential_pool
+                label_match = re.match(r'^\[(.*?)\]$', line)
+                if label_match:
+                    current_label = label_match.group(1).strip()
+                    if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", current_label):
+                        ip_specific_creds[current_label] = []
+                    else:
+                        if current_label not in credential_groups:
+                            credential_groups[current_label] = []
+                    i += 1
+                    continue
 
-def reconnect_and_retry(ip_address, creds_to_try, device_type):
+                username_match = re.match(r"Username:\s*(.*)", line, re.IGNORECASE)
+                if username_match:
+                    username = username_match.group(1).strip()
+                    if i + 1 < len(lines):
+                        password_line = lines[i+1].strip()
+                        password_match = re.match(r"Password:\s*(.*)", password_line, re.IGNORECASE)
+                        if password_match:
+                            password = password_match.group(1).strip()
+                            cred = {'username': username, 'password': password}
+                            
+                            if current_label in ip_specific_creds:
+                                ip_specific_creds[current_label].append(cred)
+                            else:
+                                credential_groups[current_label].append(cred)
+                            i += 2
+                            continue
+                
+                i += 1
+
+    except FileNotFoundError:
+        log_message(f"Error: The file '{file_path}' was not found.")
+        log_message("Please make sure 'Creds.txt' is in the same folder as the script.")
+        sys.exit()
+    except Exception as e:
+        log_message(f"An error occurred while reading the credential file: {e}")
+        sys.exit()
+
+    if not any(credential_groups.values()) and not any(ip_specific_creds.values()):
+        log_message("No valid credentials found in the file. Please check the format.")
+        sys.exit()
+
+    log_message(f"Successfully loaded {len(credential_groups.get('default', []))} default credential sets.")
+    if 'Dist' in credential_groups and credential_groups['Dist']:
+        log_message(f"Successfully loaded {len(credential_groups['Dist'])} Dist credential sets.")
+    if ip_specific_creds:
+        log_message(f"Successfully loaded {len(ip_specific_creds)} IP-specific credential sets.")
+    
+    return credential_groups, ip_specific_creds
+
+def reconnect_and_retry(ip_address, creds_to_try, device_type, cached_creds=None, is_inventory_stage=False):
     """
     Attempts to connect to a device using a given list of credentials.
-    Re-establishes a session if it fails after 3 attempts.
+    Tries cached credentials first, if available.
     """
-    for i, cred in enumerate(creds_to_try):
+    credentials_to_use = []
+    if cached_creds:
+        credentials_to_use.append(cached_creds)
+    
+    credentials_to_use.extend(creds_to_try)
+
+    consecutive_auth_failures = 0
+    net_connect = None
+
+    for i, cred in enumerate(credentials_to_use):
         username = cred['username']
         password = cred['password']
-
-        try:
-            with console_lock:
-                print(f"Attempting to connect to {ip_address} using credential set {i + 1}...")
-            net_connect = ConnectHandler(
-                device_type=device_type,
-                host=ip_address,
-                username=username,
-                password=password,
-                timeout=10
-            )
-            with console_lock:
-                print(f"Connection successful to {ip_address} using credential set {i + 1}.")
-            return net_connect, "Success"
-        except NetmikoAuthenticationException:
-            with console_lock:
-                print(f"Authentication failed for {ip_address} with credential set {i + 1}.")
-            if (i + 1) % 3 == 0 and i + 1 < len(creds_to_try):
-                with console_lock:
-                    print(f"Failed 3 consecutive times. Checking session and retrying with next credential pool...")
-                time.sleep(1) # Wait to avoid hammering the device
-            continue # Try next credential without Telnet fallback
-        except NetmikoTimeoutException as e:
-            with console_lock:
-                print(f"Connection timed out for {ip_address}. Reason: {e}")
-            return None, "Timeout"
-        except NetmikoBaseException as e:
-            with console_lock:
-                print(f"Connection failed for {ip_address}. Reason: {e}")
-            return None, "Connection Failed"
-        except Exception as e:
-            with console_lock:
-                print(f"An unexpected error occurred with {ip_address}: {e}")
-            return None, "Unexpected Error"
-
-    return None, "Authentication Failed"
-
-# ==============================================================================
-# Reporting Functions
-# ==============================================================================
-
-def create_cdp_excel_report(data, filename):
-    """
-    Creates an Excel file from the list of CDP neighbors.
-    """
-    if not data:
-        with console_lock:
-            print("No CDP neighbors found to report.")
-        return
         
-    try:
-        df = pd.DataFrame(data)
-        df.rename(columns={'Parent Device IP': 'Device IP', 'Management IP': 'Remote Device IP'}, inplace=True)
-        df = df[["Device ID", "Device IP", "Remote Device IP", "Local Intrfce", "Platform", "Remote Port", "Connection Result"]]
-        df.to_excel(filename, index=False)
-        with console_lock:
-            print(f"CDP neighbor report saved to {filename}")
-    except Exception as e:
-        with console_lock:
-            print(f"Error creating CDP Excel report: {e}")
+        if 'telnet' in device_type.lower() or ('ssh' in device_type.lower() and consecutive_auth_failures >= 3):
+            if net_connect and net_connect.is_alive():
+                try:
+                    net_connect.disconnect()
+                    log_message(f"Disconnected from {ip_address} to try a new connection for a new credential set.")
+                except Exception as e:
+                    log_message(f"Error while disconnecting from {ip_address}: {e}")
+            net_connect = None
+            consecutive_auth_failures = 0
 
-def create_inventory_excel_report(results, filename):
-    """
-    Creates an Excel file from the collected inventory results.
-    """
-    if not results:
-        with console_lock:
-            print("No inventory data found to report.")
-        return
-        
-    try:
-        df = pd.DataFrame(results)
-        headers = ["ip", "product_id", "serial_number", "status", "error"]
-        df = df[headers]
-        df.rename(columns={
-            'ip': 'Management IP', 
-            'product_id': 'Product ID', 
-            'serial_number': 'Serial Number',
-            'status': 'Connection Status',
-            'error': 'Error Message'
-        }, inplace=True)
-        df.to_excel(filename, index=False)
-        with console_lock:
-            print(f"\nInventory report saved to {filename}")
-    except Exception as e:
-        with console_lock:
-            print(f"\nError creating Inventory Excel report: {e}")
+        if not net_connect:
+            protocol = "Telnet" if 'telnet' in device_type.lower() else "SSH"
             
-# ==============================================================================
-# CDP Discovery Functions
-# ==============================================================================
+            log_message(f"Attempting to connect to {ip_address} via {protocol} with credential set {i + 1}...")
+            
+            connect_params = {
+                'device_type': device_type,
+                'host': ip_address,
+                'username': username,
+                'password': password,
+                'timeout': 60,
+                'global_delay_factor': 2,
+                'fast_cli': False
+            }
 
-def get_cdp_neighbors(ip_address, credential_pool):
+            try:
+                net_connect = ConnectHandler(**connect_params)
+            except NetmikoAuthenticationException:
+                log_message(f"Authentication failed for {ip_address}.")
+                consecutive_auth_failures += 1
+                continue
+            except NetmikoTimeoutException:
+                log_message(f"Connection timed out to {ip_address}.")
+                consecutive_auth_failures += 1
+                continue
+            except Exception as e:
+                log_message(f"An unexpected error occurred for {ip_address}: {e}")
+                consecutive_auth_failures += 1
+                continue
+                
+            log_message(f"Connection successful to {ip_address} via {protocol} with credential set {i + 1}.")
+            return net_connect, "Success", cred
+        
+    if net_connect:
+        net_connect.disconnect()
+    return None, "Authentication Failed", None
+
+def create_combined_excel_report(cdp_data, inventory_data, filename):
     """
-    Connects to the device using the credential pool and returns the output.
+    Creates a single Excel file with two sheets: one for CDP and one for Inventory.
     """
-    net_connect, status = reconnect_and_retry(ip_address, credential_pool, 'cisco_ios')
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        reports_dir = os.path.join(script_dir, "Reports")
+        os.makedirs(reports_dir, exist_ok=True)
+        
+        full_path = os.path.join(reports_dir, filename)
+
+        if not cdp_data and not inventory_data:
+            log_message("No data to report. Skipping Excel file creation.")
+            return
+
+        with pd.ExcelWriter(full_path, engine='xlsxwriter') as writer:
+            if cdp_data:
+                df_cdp = pd.DataFrame(cdp_data)
+                df_cdp.rename(columns={'Management IP': 'Remote Device IP'}, inplace=True)
+                df_cdp = df_cdp[["Device ID", "Found Via", "Remote Device IP", "Local Intrfce", "Platform", "Remote Port", "Connection Result"]]
+                df_cdp.to_excel(writer, sheet_name='CDP Discovery', index=False)
+                log_message("CDP discovery data written to 'CDP Discovery' sheet.")
+
+            if inventory_data:
+                df_inv = pd.DataFrame(inventory_data)
+                headers = ["ip", "product_id", "serial_number", "hostname", "status", "error"]
+                df_inv = df_inv[headers]
+                df_inv.rename(columns={
+                    'ip': 'Management IP', 
+                    'product_id': 'Product ID', 
+                    'serial_number': 'Serial Number',
+                    'hostname': 'Hostname',
+                    'status': 'Connection Status',
+                    'error': 'Error Message'
+                }, inplace=True)
+                df_inv.to_excel(writer, sheet_name='Inventory Report', index=False)
+                log_message("Inventory data written to 'Inventory Report' sheet.")
+        
+        log_message(f"\nCombined network report saved to {full_path}")
+
+    except Exception as e:
+        log_message(f"Error creating combined Excel report: {e}")
+            
+def get_cdp_neighbors(ip_address, credential_pool, cached_creds, dist_creds, ip_specific_creds):
+    """
+    Connects to the device and returns the raw output and the live Netmiko object.
+    """
+    creds_to_try = []
+    
+    if ip_address in ip_specific_creds:
+        log_message(f"Using IP-specific credentials for {ip_address}.")
+        creds_to_try.extend(ip_specific_creds[ip_address])
+    
+    cached_info = working_creds.get(ip_address)
+    if cached_info and cached_info.get('platform', '').startswith("cisco WS-C45"):
+        log_message(f"Using [Dist] credentials for {ip_address} based on platform.")
+        creds_to_try.extend(dist_creds)
+    
+    creds_to_try.extend(credential_pool)
+
+    net_connect, status, used_creds = reconnect_and_retry(ip_address, creds_to_try, 'cisco_ios', cached_creds)
     output = None
     if status == "Success":
-        output = net_connect.send_command('show cdp neighbor detail')
-        net_connect.disconnect()
-        return output, "Success"
-    
-    # Fallback to Telnet if SSH failed for reasons other than authentication
-    if "Connection" in status or "Timeout" in status or "Unexpected" in status:
-        net_connect, telnet_status = reconnect_and_retry(ip_address, credential_pool, 'cisco_ios_telnet')
-        if telnet_status == "Success":
-            output = net_connect.send_command('show cdp neighbor detail')
+        try:
+            output = net_connect.send_command('show cdp neighbor detail', delay_factor=2)
+            return output, "Success", used_creds, net_connect, 'cisco_ios'
+        except ReadTimeout as e:
+            log_message(f"ReadTimeout on {ip_address}: {e}")
             net_connect.disconnect()
-            return output, "Success via Telnet"
-        return None, f"Failed via SSH ({status}) and Telnet ({telnet_status})"
+            return None, "Read Timeout", None, None, None
+        except Exception as e:
+            log_message(f"Error sending command to {ip_address}: {e}")
+            net_connect.disconnect()
+            return None, "Command Error", None, None, None
+    
+    if "Authentication Failed" in status:
+        log_message(f"SSH authentication failed for {ip_address}. Skipping Telnet attempt.")
+        return None, f"Failed: {status}", None, None, None
 
-    return None, f"Failed: {status}"
+    if "Connection" in status or "Timeout" in status or "Unexpected" in status:
+        net_connect, telnet_status, used_creds = reconnect_and_retry(ip_address, creds_to_try, 'cisco_ios_telnet', cached_creds)
+        if telnet_status == "Success":
+            try:
+                output = net_connect.send_command('show cdp neighbor detail', delay_factor=2)
+                return output, "Success via Telnet", used_creds, net_connect, 'cisco_ios_telnet'
+            except ReadTimeout as e:
+                log_message(f"ReadTimeout on {ip_address} via Telnet: {e}")
+                net_connect.disconnect()
+                return None, "Read Timeout via Telnet", None, None, None
+            except Exception as e:
+                log_message(f"Error sending command to {ip_address} via Telnet: {e}")
+                net_connect.disconnect()
+                return None, "Command Error via Telnet", None, None, None
+        return None, f"Failed via SSH ({status}) and Telnet ({telnet_status})", None, None, None
 
-def parse_cdp_output(output, parent_ip, connection_result):
+    return None, f"Failed: {status}", None, None, None
+
+def parse_cdp_output(output, parent_ip, connection_result, found_via):
     """
-    Parses the raw 'show cdp neighbor detail' output and adds the parent IP and connection result.
+    Parses the raw 'show cdp neighbor detail' output and adds found_via info.
     """
     neighbors = []
-    
     if output:
-        neighbor_blocks = re.split(r'-------------------------', output)
+        neighbor_blocks = re.split(r'^-+$', output, flags=re.MULTILINE)
+        
         patterns = {
             'Device ID': re.compile(r'Device ID: (.+)', re.IGNORECASE),
             'Local Intrfce': re.compile(r'Interface: (.+?),', re.IGNORECASE),
             'Platform': re.compile(r'Platform: (.+?),', re.IGNORECASE),
             'Remote Port': re.compile(r'Port ID \(outgoing port\): (.+)', re.IGNORECASE),
-            'Management IP': re.compile(r'Entry address\(es\):\s*IP address: (\S+)', re.IGNORECASE | re.DOTALL),
+            'Mgmt IP': re.compile(r'Entry address\(es\):\s*IP address: (\S+)', re.IGNORECASE | re.DOTALL),
+            'Interface IP': re.compile(r'Interface address\(es\):\s*IPv4 Address:\s*(\S+)', re.IGNORECASE | re.DOTALL)
         }
 
         for block in neighbor_blocks:
             if "Device ID" in block:
-                neighbor = {'Parent Device IP': parent_ip, 'Connection Result': connection_result}
+                neighbor = {'Found Via': found_via, 'Connection Result': connection_result}
                 for key, pattern in patterns.items():
                     match = pattern.search(block)
                     if match:
@@ -188,85 +295,134 @@ def parse_cdp_output(output, parent_ip, connection_result):
                     else:
                         neighbor[key] = "Not Found"
                 
-                if len(neighbor) == len(patterns) + 2:
-                    neighbors.append(neighbor)
+                final_neighbor = {
+                    'Device ID': neighbor['Device ID'],
+                    'Found Via': neighbor['Found Via'],
+                    'Connection Result': neighbor['Connection Result'],
+                    'Platform': neighbor['Platform'],
+                    'Local Intrfce': neighbor['Local Intrfce'],
+                    'Remote Port': neighbor['Remote Port']
+                }
+
+                if neighbor['Mgmt IP'] != 'Not Found':
+                    final_neighbor['Management IP'] = neighbor['Mgmt IP']
+                elif neighbor['Interface IP'] != 'Not Found':
+                    final_neighbor['Management IP'] = neighbor['Interface IP']
+                else:
+                    final_neighbor['Management IP'] = 'Not Found'
+                
+                neighbors.append(final_neighbor)
     
-    if not output:
+    if not output or not neighbors:
         failed_entry = {
             'Device ID': f"Failed - {parent_ip}",
-            'Parent Device IP': parent_ip,
+            'Found Via': found_via,
             'Connection Result': connection_result,
             'Local Intrfce': 'N/A',
             'Platform': 'N/A',
             'Remote Port': 'N/A',
-            'Management IP': 'N/A'
+            'Management IP': parent_ip
         }
         neighbors.append(failed_entry)
         
     return neighbors
 
-def cdp_worker(host_data, credential_pool, processed_ips_lock):
+def cdp_worker(host_info, credential_groups, ip_specific_creds, processed_ips_lock, working_creds):
     """
     Worker function for each thread in CDP scanning.
     """
-    ip = host_data['ip']
-    platform = host_data.get('platform', 'Unknown')
-
+    ip = host_info['ip']
+    found_via = host_info['found_via']
+    
     with processed_ips_lock:
         if ip in processed_ips:
-            return []
-        
+            return [], [], None, None
         processed_ips.add(ip)
-        
-    output, result = get_cdp_neighbors(ip, credential_pool)
+
+    cached_info = working_creds.get(ip)
+    cached_creds = cached_info.get('creds') if cached_info else None
     
-    results = parse_cdp_output(output, ip, result)
-    return results
+    dist_creds = credential_groups.get('Dist', [])
 
-# ==============================================================================
-# Inventory Collection Functions
-# ==============================================================================
+    output, result, used_creds, net_connect, device_type = get_cdp_neighbors(
+        ip, 
+        credential_groups.get('default', []), 
+        cached_creds,
+        dist_creds,
+        ip_specific_creds
+    )
 
-def get_inventory_from_device(host, credential_pool):
+    if used_creds and device_type:
+        platform = ""
+        if output:
+            platform_match = re.search(r'Platform: (.+?),', output, re.IGNORECASE)
+            if platform_match:
+                platform = platform_match.group(1).strip()
+        
+        with processed_ips_lock:
+            working_creds[ip] = {'creds': used_creds, 'device_type': device_type, 'platform': platform}
+
+    neighbors_list = parse_cdp_output(output, ip, result, found_via)
+    
+    new_ips_found = []
+    for neighbor in neighbors_list:
+        remote_ip = neighbor.get('Management IP')
+        remote_platform = neighbor.get('Platform', 'Unknown')
+        if remote_ip and remote_ip != 'Not Found' and remote_ip not in processed_ips:
+            if "cisco AIR" not in str(remote_platform) and "cisco C9120" not in str(remote_platform):
+                new_ips_found.append({'ip': remote_ip, 'found_via': ip})
+    
+    return neighbors_list, new_ips_found, net_connect, device_type
+
+def get_inventory_from_device(host, credential, cached_protocol):
     """
-    Connects to a Cisco device, runs 'show inventory', and extracts PID/SN pairs,
-    using the credential pool.
+    Connects to a Cisco device and gets inventory.
     """
     base_result = {
         'ip': host,
         'status': 'Failure',
         'error': ''
     }
-    output = None
+    net_connect = None
     
-    net_connect, status = reconnect_and_retry(host, credential_pool, 'cisco_ios')
-    
-    if status == "Success":
-        try:
-            output = net_connect.send_command("show inventory")
-            base_result['status'] = 'Success (SSH)'
-        except Exception as e:
-            base_result['error'] = f"Command failed: {e}"
-        finally:
-            net_connect.disconnect()
+    try:
+        net_connect, status, _ = reconnect_and_retry(host, [], cached_protocol, credential, is_inventory_stage=True)
+        if status != "Success":
+            if cached_protocol == 'cisco_ios':
+                alt_protocol = 'cisco_ios_telnet'
+            else:
+                alt_protocol = 'cisco_ios'
             
-    elif "Connection" in status or "Timeout" in status or "Unexpected" in status:
-        net_connect, telnet_status = reconnect_and_retry(host, credential_pool, 'cisco_ios_telnet')
-        if telnet_status == "Success":
-            try:
-                output = net_connect.send_command("show inventory")
-                base_result['status'] = 'Success (Telnet)'
-            except Exception as e:
-                base_result['error'] = f"Command failed: {e}"
-            finally:
-                net_connect.disconnect()
-        else:
-            base_result['error'] = f"Failed via SSH ({status}) and Telnet ({telnet_status})"
-    else:
-        base_result['error'] = f"Failed: {status}"
+            log_message(f"Cached protocol ({cached_protocol.upper()}) failed for {host}. Trying {alt_protocol.upper()}...")
+            net_connect, status, _ = reconnect_and_retry(host, [], alt_protocol, credential, is_inventory_stage=True)
+            if status != "Success":
+                base_result['error'] = f"Failed to connect via both protocols: {status}"
+                return [{**base_result, 'product_id': 'N/A', 'serial_number': 'N/A', 'hostname': 'N/A'}]
+    
+        platform_output = net_connect.send_command("show version | include Platform", delay_factor=2).strip()
+        device_type = 'cisco_ios'
+        if 'N3K' in platform_output or 'N9K' in platform_output:
+            device_type = 'cisco_nxos'
+            
+        if net_connect.device_type != device_type:
+            net_connect.disconnect()
+            net_connect, status, _ = reconnect_and_retry(host, [], device_type, credential, is_inventory_stage=True)
+            if status != "Success":
+                base_result['error'] = f"Failed to reconnect with correct type: {status}"
+                return [{**base_result, 'product_id': 'N/A', 'serial_number': 'N/A', 'hostname': 'N/A'}]
 
-    inventory_items = []
-    if output:
+        if device_type == 'cisco_nxos':
+            hostname_output = net_connect.send_command("show hostname", delay_factor=2).strip()
+        else:
+            hostname_output = net_connect.send_command("show running-config | include hostname", delay_factor=2).strip()
+            hostname_match = re.search(r'hostname\s+(\S+)', hostname_output)
+            hostname_output = hostname_match.group(1) if hostname_match else "Hostname Not Found"
+        
+        output = net_connect.send_command("show inventory", delay_factor=2)
+        base_result['hostname'] = hostname_output
+        base_result['status'] = f'Success ({net_connect.device_type.split("_")[1].upper()})'
+
+        inventory_items = []
         pid_sn_pairs = re.findall(r"PID:\s*(\S+).*?SN:\s*(\S+)", output, re.DOTALL)
         if pid_sn_pairs:
             for pid, sn in pid_sn_pairs:
@@ -275,142 +431,157 @@ def get_inventory_from_device(host, credential_pool):
         else:
             item = {**base_result, 'product_id': 'Not Found', 'serial_number': 'Not Found', 'error': 'No PID/SN found in output'}
             inventory_items.append(item)
-    else:
-        item = {**base_result, 'product_id': 'N/A', 'serial_number': 'N/A', 'error': base_result['error']}
-        inventory_items.append(item)
-    
-    return inventory_items
+        return inventory_items
+            
+    except Exception as e:
+        base_result['error'] = f"Command/Connection failed: {e}"
+        return [{**base_result, 'product_id': 'N/A', 'serial_number': 'N/A', 'hostname': 'N/A'}]
+    finally:
+        if net_connect and net_connect.is_alive():
+            net_connect.disconnect()
 
-def inventory_worker(ip_address, credential_pool):
+def inventory_worker(cdp_result, working_creds):
     """
     Worker function for each thread in inventory scanning.
     """
-    return get_inventory_from_device(ip_address, credential_pool)
-
-# ==============================================================================
-# Main Script Execution
-# ==============================================================================
-
-if __name__ == '__main__':
-    initial_ip_for_cdp_scan = input("Enter the initial IP address to scan for CDP neighbors: ")
+    ip_address, net_connect_obj = cdp_result
+    cached_info = working_creds.get(ip_address)
+    cached_cred_for_host = cached_info.get('creds') if cached_info else None
+    cached_protocol = cached_info.get('device_type') if cached_info else 'cisco_ios'
     
-    if not initial_ip_for_cdp_scan:
-        print("Invalid input. Please provide an IP address.")
+    if net_connect_obj:
+        net_connect_obj.disconnect()
+        
+    return get_inventory_from_device(ip_address, cached_cred_for_host, cached_protocol)
+
+def get_initial_ips_from_file():
+    """
+    Reads IP addresses from a file named "IPs.txt".
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(script_dir, "IPs.txt")
+    
+    ips = []
+    try:
+        with open(file_path, 'r') as f:
+            file_content = f.read()
+            ips = [ip.strip() for ip in file_content.replace('\n', ',').split(',') if ip.strip()]
+    except FileNotFoundError:
+        log_message(f"Error: The file '{file_path}' was not found.")
+        log_message("Please create 'IPs.txt' in the same folder as the script and list your initial IPs, one per line or separated by commas.")
+        sys.exit()
+    except Exception as e:
+        log_message(f"An error occurred while reading the IPs file: {e}")
         sys.exit()
 
-    num_iterations_str = input("How many CDP discovery iterations should the script try? (default: 2): ")
-    try:
-        num_iterations = int(num_iterations_str) if num_iterations_str else 2
-    except ValueError:
-        print("Invalid number of iterations. Defaulting to 2.")
-        num_iterations = 2
+    if not ips:
+        log_message("No IP addresses found in 'IPs.txt'. Please ensure the file contains IPs.")
+        sys.exit()
     
-    all_cdp_neighbors = []
-    processed_ips = set()
-    processed_ips_lock = threading.Lock()
-    
-    # --- Phase 1: CDP Discovery ---
-    print("\n" + "="*50)
-    print("Starting CDP Neighbor Discovery Phase")
-    print("="*50)
-    
-    print("\n--- Starting Initial CDP Scan ---")
-    credential_pool = get_credential_pool()
+    log_message(f"Successfully loaded {len(ips)} initial IP addresses from 'IPs.txt'.")
+    return [{'ip': ip, 'found_via': 'Initial IP'} for ip in ips]
 
-    initial_output, initial_result = get_cdp_neighbors(initial_ip_for_cdp_scan, credential_pool)
-    if initial_output:
-        initial_neighbors = parse_cdp_output(initial_output, initial_ip_for_cdp_scan, initial_result)
-        all_cdp_neighbors.extend(initial_neighbors)
-    else:
-        all_cdp_neighbors.extend(parse_cdp_output(None, initial_ip_for_cdp_scan, initial_result))
+if __name__ == '__main__':
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    logs_dir = os.path.join(script_dir, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    timestamp_log = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_filename = f"network_discovery_log_{timestamp_log}.txt"
+    log_file_path = os.path.join(logs_dir, log_filename)
     
-    processed_ips.add(initial_ip_for_cdp_scan)
+    with open(log_file_path, 'w') as log_file:
+        initial_ips_for_cdp_scan = get_initial_ips_from_file()
+        
+        num_iterations_str = input("How many CDP discovery iterations should the script try? (default: 2): ")
+        try:
+            num_iterations = int(num_iterations_str) if num_iterations_str else 2
+        except ValueError:
+            log_message("Invalid number of iterations. Defaulting to 2.")
+            num_iterations = 2
 
-    for i in range(num_iterations):
-        with console_lock:
-            print(f"\n--- Starting CDP Loop {i+1} Scan on Discovered Neighbors ---")
+        connections_to_reuse = []
+        all_cdp_neighbors = []
+        processed_ips = set()
+        processed_ips_lock = threading.Lock()
+        working_creds = {}
+
+        log_message("\n" + "="*50)
+        log_message("Starting CDP Neighbor Discovery Phase")
+        log_message("="*50)
         
-        hosts_to_scan_for_cdp = []
+        credential_groups, ip_specific_creds = get_credential_pool_from_file()
+        hosts_to_scan_for_cdp = initial_ips_for_cdp_scan
         
-        potential_next_hops = set()
-        
-        for neighbor_entry in all_cdp_neighbors:
-            parent_ip = neighbor_entry.get('Parent Device IP')
-            remote_ip = neighbor_entry.get('Management IP')
-            remote_platform = neighbor_entry.get('Platform', 'Unknown')
+        for i in range(num_iterations):
+            log_message(f"\n--- Starting CDP Loop {i+1} Scan on {len(hosts_to_scan_for_cdp)} devices ---")
             
-            if parent_ip and parent_ip not in processed_ips and "Success" in neighbor_entry.get('Connection Result', ''):
-                potential_next_hops.add((parent_ip, "Unknown"))
+            new_cdp_neighbors = []
+            new_ips_to_scan = []
             
-            if remote_ip and remote_ip != 'Not Found' and remote_ip not in processed_ips:
-                if "cisco" in str(remote_platform).lower() and "cisco AIR" not in str(remote_platform) and "cisco C9120" not in str(remote_platform):
-                    potential_next_hops.add((remote_ip, remote_platform))
-        
-        for ip, platform in potential_next_hops:
-            hosts_to_scan_for_cdp.append({'ip': ip, 'platform': platform})
-
-        if not hosts_to_scan_for_cdp:
-            with console_lock:
-                print("No new valid management IPs found to scan for CDP. Ending loop.")
-            break
-            
-        with console_lock:
-            print(f"Found {len(hosts_to_scan_for_cdp)} new neighbors to check for CDP.")
-        
-        new_cdp_neighbors = []
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_results = [
-                executor.submit(cdp_worker, host, credential_pool, processed_ips_lock)
-                for host in hosts_to_scan_for_cdp
-            ]
-            for future in future_results:
-                new_cdp_neighbors.extend(future.result())
-        
-        all_cdp_neighbors.extend(new_cdp_neighbors)
-    
-    final_cdp_neighbors = {}
-    for neighbor in all_cdp_neighbors:
-        key = (neighbor.get('Device ID'), neighbor.get('Parent Device IP'))
-        final_cdp_neighbors[key] = neighbor
-    
-    timestamp_cdp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename_cdp = f"cdp_neighbors_{initial_ip_for_cdp_scan}_{timestamp_cdp}.xlsx"
-    create_cdp_excel_report(list(final_cdp_neighbors.values()), filename_cdp)
-
-    # --- Phase 2: Inventory Collection Prompt ---
-    get_inventory_response = input("\nDo you want to get inventory information from discovered devices? (yes/no): ").lower()
-
-    if get_inventory_response == 'yes':
-        print("\n" + "="*50)
-        print("Starting Inventory Collection Phase")
-        print("="*50)
-
-        inventory_ips_to_scan = set()
-        
-        for neighbor in final_cdp_neighbors.values():
-            parent_ip = neighbor.get('Parent Device IP')
-            if parent_ip and "Success" in neighbor['Connection Result']:
-                inventory_ips_to_scan.add(parent_ip)
-
-        if not inventory_ips_to_scan:
-            print("No valid Cisco device IPs discovered for inventory collection.")
-        else:
-            inventory_results = []
-            with console_lock:
-                print(f"Starting inventory scan on {len(inventory_ips_to_scan)} devices using the credential pool.")
-            
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                futures = [
-                    executor.submit(inventory_worker, ip, credential_pool)
-                    for ip in inventory_ips_to_scan
+            with ThreadPoolExecutor(max_workers=50) as executor:
+                future_results = [
+                    executor.submit(cdp_worker, ip, credential_groups, ip_specific_creds, processed_ips_lock, working_creds)
+                    for ip in hosts_to_scan_for_cdp
                 ]
-                for future in futures:
-                    inventory_results.extend(future.result())
+                for future in future_results:
+                    results, discovered_ips, net_connect_obj, protocol = future.result()
+                    new_cdp_neighbors.extend(results)
+                    new_ips_to_scan.extend(discovered_ips)
+                    
+                    if net_connect_obj:
+                        connections_to_reuse.append((net_connect_obj.host, net_connect_obj))
+            
+            all_cdp_neighbors.extend(new_cdp_neighbors)
+            
+            if not new_ips_to_scan:
+                log_message("No new valid management IPs found to scan for CDP. Ending loop.")
+                break
+                
+            hosts_to_scan_for_cdp = new_ips_to_scan
 
-            timestamp_inv = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            filename_inv = f"network_inventory_report_{initial_ip_for_cdp_scan}_{timestamp_inv}.xlsx"
-            create_inventory_excel_report(inventory_results, filename_inv)
-    else:
-        print("Inventory collection skipped.")
+        inventory_results_list = []
+        get_inventory_response = input("\nDo you want to get inventory information from discovered devices? (yes/no): ").lower()
 
-    print("\nScript execution finished.")
+        if get_inventory_response == 'yes':
+            log_message("\n" + "="*50)
+            log_message("Starting Inventory Collection Phase")
+            log_message("="*50)
+
+            inventory_ips_to_scan = set()
+            for neighbor in all_cdp_neighbors:
+                remote_ip = neighbor.get('Management IP')
+                if remote_ip and remote_ip != 'Not Found':
+                    inventory_ips_to_scan.add(remote_ip)
+            
+            reused_connections_map = {ip: conn for ip, conn in connections_to_reuse}
+            inventory_work_list = []
+            for ip in inventory_ips_to_scan:
+                net_connect_obj = reused_connections_map.get(ip)
+                inventory_work_list.append((ip, net_connect_obj))
+
+            if not inventory_ips_to_scan:
+                log_message("No valid Cisco device IPs discovered for inventory collection.")
+            else:
+                log_message(f"Starting inventory scan on {len(inventory_ips_to_scan)} devices.")
+                
+                with ThreadPoolExecutor(max_workers=50) as executor:
+                    futures = [
+                        executor.submit(inventory_worker, work_item, working_creds)
+                        for work_item in inventory_work_list
+                    ]
+                    for future in futures:
+                        inventory_results_list.extend(future.result())
+        else:
+            log_message("Inventory collection skipped.")
+
+        final_cdp_neighbors = {}
+        for neighbor in all_cdp_neighbors:
+            key = (neighbor.get('Device ID'), neighbor.get('Found Via'))
+            final_cdp_neighbors[key] = neighbor
+        
+        cdp_results_list = list(final_cdp_neighbors.values())
+        
+        timestamp_report = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"network_discovery_report_{timestamp_report}.xlsx"
+        create_combined_excel_report(cdp_results_list, inventory_results_list, filename)
+        log_message("\nScript execution finished.")
