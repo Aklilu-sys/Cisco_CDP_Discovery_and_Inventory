@@ -9,6 +9,7 @@ import threading
 import time
 import getpass
 import os
+import ipaddress
 
 # --- Global Locks for Console Output and Logging ---
 console_lock = threading.Lock()
@@ -31,18 +32,17 @@ def log_message(message, timestamp=True):
 
 def get_credential_pool_from_file():
     """
-    Looks for a file named "Creds.txt" in the same directory as the script
-    and reads multiple sets of credentials based on labels from it.
-    Returns a dictionary of credential lists keyed by the label.
+    Reads credentials from "Creds.txt" and returns them categorized.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(script_dir, "Creds.txt")
     
-    credential_groups = {}
+    other_creds = []
     ip_specific_creds = {}
-    current_label = 'default'
-    credential_groups[current_label] = []
-
+    network_specific_creds = {}
+    
+    current_target_list = other_creds
+    
     try:
         with open(file_path, 'r') as f:
             lines = f.readlines()
@@ -51,19 +51,33 @@ def get_credential_pool_from_file():
             while i < len(lines):
                 line = lines[i].strip()
                 
-                # Skip blank lines and comments
                 if not line or line.startswith('#'):
                     i += 1
                     continue
 
                 label_match = re.match(r'^\[(.*?)\]$', line)
                 if label_match:
-                    current_label = label_match.group(1).strip()
-                    if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", current_label):
-                        ip_specific_creds[current_label] = []
+                    current_label_content = label_match.group(1).strip()
+                    
+                    # Updated regex to handle comma-separated networks
+                    network_match = re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}(,\s*\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2})*$", current_label_content)
+                    
+                    if network_match:
+                        network_list = [net.strip() for net in current_label_content.split(',')]
+                        # Create a temporary list to hold credentials for all networks in this group
+                        temp_cred_list = []
+                        for net in network_list:
+                            network_specific_creds[net] = temp_cred_list
+                        current_target_list = temp_cred_list
+                    elif re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(,\s*\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})*$", current_label_content):
+                        ip_list = [ip.strip() for ip in current_label_content.split(',')]
+                        temp_cred_list = []
+                        for ip in ip_list:
+                            ip_specific_creds[ip] = temp_cred_list
+                        current_target_list = temp_cred_list
                     else:
-                        if current_label not in credential_groups:
-                            credential_groups[current_label] = []
+                        current_target_list = other_creds
+                    
                     i += 1
                     continue
 
@@ -76,12 +90,11 @@ def get_credential_pool_from_file():
                         if password_match:
                             password = password_match.group(1).strip()
                             cred = {'username': username, 'password': password}
-                            
-                            if current_label in ip_specific_creds:
-                                ip_specific_creds[current_label].append(cred)
-                            else:
-                                credential_groups[current_label].append(cred)
+                            current_target_list.append(cred)
                             i += 2
+                            # After adding credentials, reset to 'other' unless the next line is a new label
+                            if i < len(lines) and not re.match(r'^\[(.*?)\]$', lines[i].strip()):
+                                current_target_list = other_creds
                             continue
                 
                 i += 1
@@ -94,17 +107,17 @@ def get_credential_pool_from_file():
         log_message(f"An error occurred while reading the credential file: {e}")
         sys.exit()
 
-    if not any(credential_groups.values()) and not any(ip_specific_creds.values()):
+    if not other_creds and not ip_specific_creds and not network_specific_creds:
         log_message("No valid credentials found in the file. Please check the format.")
         sys.exit()
 
-    log_message(f"Successfully loaded {len(credential_groups.get('default', []))} default credential sets.")
-    if 'Dist' in credential_groups and credential_groups['Dist']:
-        log_message(f"Successfully loaded {len(credential_groups['Dist'])} Dist credential sets.")
+    log_message(f"Successfully loaded {len(other_creds)} general credential sets.")
     if ip_specific_creds:
         log_message(f"Successfully loaded {len(ip_specific_creds)} IP-specific credential sets.")
+    if network_specific_creds:
+        log_message(f"Successfully loaded {len(network_specific_creds)} network-specific credential sets.")
     
-    return credential_groups, ip_specific_creds
+    return ip_specific_creds, network_specific_creds, other_creds
 
 def reconnect_and_retry(ip_address, creds_to_try, device_type, cached_creds=None, is_inventory_stage=False):
     """
@@ -214,22 +227,38 @@ def create_combined_excel_report(cdp_data, inventory_data, filename):
     except Exception as e:
         log_message(f"Error creating combined Excel report: {e}")
             
-def get_cdp_neighbors(ip_address, credential_pool, cached_creds, dist_creds, ip_specific_creds):
+def get_cdp_neighbors(ip_address, ip_specific_creds, network_specific_creds, other_creds, cached_creds):
     """
     Connects to the device and returns the raw output and the live Netmiko object.
+    Builds a prioritized credential list for each device based on the rules.
     """
     creds_to_try = []
-    
+
+    # Rule 1: IP-Specific Credentials
     if ip_address in ip_specific_creds:
-        log_message(f"Using IP-specific credentials for {ip_address}.")
+        log_message(f"Prioritizing IP-specific credentials for {ip_address}.")
         creds_to_try.extend(ip_specific_creds[ip_address])
-    
-    cached_info = working_creds.get(ip_address)
-    if cached_info and cached_info.get('platform', '').startswith("cisco WS-C45"):
-        log_message(f"Using [Dist] credentials for {ip_address} based on platform.")
-        creds_to_try.extend(dist_creds)
-    
-    creds_to_try.extend(credential_pool)
+        creds_to_try.extend(other_creds)
+    # Rule 2: Network-Specific Credentials
+    else:
+        found_network_match = False
+        try:
+            ip_obj = ipaddress.ip_address(ip_address)
+            for network, creds in network_specific_creds.items():
+                network_obj = ipaddress.ip_network(network)
+                if ip_obj in network_obj:
+                    log_message(f"Prioritizing network-specific credentials for {ip_address} from {network}.")
+                    creds_to_try.extend(creds)
+                    creds_to_try.extend(other_creds)
+                    found_network_match = True
+                    break
+        except ValueError:
+            log_message(f"Invalid network notation found in Creds.txt.")
+        
+        # Rule 3: Use remaining credentials
+        if not found_network_match:
+            log_message(f"No specific credentials found for {ip_address}. Using general credentials.")
+            creds_to_try.extend(other_creds)
 
     net_connect, status, used_creds = reconnect_and_retry(ip_address, creds_to_try, 'cisco_ios', cached_creds)
     output = None
@@ -327,7 +356,7 @@ def parse_cdp_output(output, parent_ip, connection_result, found_via):
         
     return neighbors
 
-def cdp_worker(host_info, credential_groups, ip_specific_creds, processed_ips_lock, working_creds):
+def cdp_worker(host_info, ip_specific_creds, network_specific_creds, other_creds, processed_ips_lock, working_creds):
     """
     Worker function for each thread in CDP scanning.
     """
@@ -342,14 +371,12 @@ def cdp_worker(host_info, credential_groups, ip_specific_creds, processed_ips_lo
     cached_info = working_creds.get(ip)
     cached_creds = cached_info.get('creds') if cached_info else None
     
-    dist_creds = credential_groups.get('Dist', [])
-
     output, result, used_creds, net_connect, device_type = get_cdp_neighbors(
         ip, 
-        credential_groups.get('default', []), 
-        cached_creds,
-        dist_creds,
-        ip_specific_creds
+        ip_specific_creds,
+        network_specific_creds,
+        other_creds, 
+        cached_creds
     )
 
     if used_creds and device_type:
@@ -365,13 +392,11 @@ def cdp_worker(host_info, credential_groups, ip_specific_creds, processed_ips_lo
     neighbors_list = parse_cdp_output(output, ip, result, found_via)
     
     new_ips_found = []
-    # Fixed: The platform_filter is now correctly in lowercase.
     platform_filter = ['cisco', 'n9k', 'n3k']
     for neighbor in neighbors_list:
         remote_ip = neighbor.get('Management IP')
         remote_platform = neighbor.get('Platform', 'Unknown').lower()
         if remote_ip and remote_ip != 'Not Found' and remote_ip not in processed_ips:
-            # Fixed: "cisco c9120" is now "cisco c912" for broader exclusion.
             if any(p in remote_platform for p in platform_filter) and "cisco air" not in remote_platform and "cisco c912" not in remote_platform:
                 new_ips_found.append({'ip': remote_ip, 'found_via': ip})
             else:
@@ -514,7 +539,7 @@ if __name__ == '__main__':
         log_message("Starting CDP Neighbor Discovery Phase")
         log_message("="*50)
         
-        credential_groups, ip_specific_creds = get_credential_pool_from_file()
+        ip_specific_creds, network_specific_creds, other_creds = get_credential_pool_from_file()
         hosts_to_scan_for_cdp = initial_ips_for_cdp_scan
         
         for i in range(num_iterations):
@@ -525,7 +550,7 @@ if __name__ == '__main__':
             
             with ThreadPoolExecutor(max_workers=50) as executor:
                 future_results = [
-                    executor.submit(cdp_worker, ip, credential_groups, ip_specific_creds, processed_ips_lock, working_creds)
+                    executor.submit(cdp_worker, ip, ip_specific_creds, network_specific_creds, other_creds, processed_ips_lock, working_creds)
                     for ip in hosts_to_scan_for_cdp
                 ]
                 for future in future_results:
