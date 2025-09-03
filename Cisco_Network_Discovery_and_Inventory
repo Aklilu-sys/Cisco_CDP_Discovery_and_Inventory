@@ -119,7 +119,7 @@ def get_credential_pool_from_file():
     
     return ip_specific_creds, network_specific_creds, other_creds
 
-def reconnect_and_retry(ip_address, creds_to_try, device_type, cached_creds=None, is_inventory_stage=False):
+def reconnect_and_retry(ip_address, creds_to_try, device_type, cached_creds=None):
     """
     Attempts to connect to a device using a given list of credentials.
     Tries cached credentials first, if available.
@@ -130,59 +130,45 @@ def reconnect_and_retry(ip_address, creds_to_try, device_type, cached_creds=None
     
     credentials_to_use.extend(creds_to_try)
 
-    consecutive_auth_failures = 0
-    net_connect = None
-
     for i, cred in enumerate(credentials_to_use):
         username = cred['username']
         password = cred['password']
         
-        if 'telnet' in device_type.lower() or ('ssh' in device_type.lower() and consecutive_auth_failures >= 3):
-            if net_connect and net_connect.is_alive():
-                try:
-                    net_connect.disconnect()
-                    log_message(f"Disconnected from {ip_address} to try a new connection for a new credential set.")
-                except Exception as e:
-                    log_message(f"Error while disconnecting from {ip_address}: {e}")
-            net_connect = None
-            consecutive_auth_failures = 0
+        protocol = "Telnet" if 'telnet' in device_type.lower() else "SSH"
+        
+        log_message(f"Attempting to connect to {ip_address} via {protocol} with credential set {i + 1}...")
+        
+        connect_params = {
+            'device_type': device_type,
+            'host': ip_address,
+            'username': username,
+            'password': password,
+            'timeout': 60,
+            'global_delay_factor': 2,
+            'fast_cli': False
+        }
 
-        if not net_connect:
-            protocol = "Telnet" if 'telnet' in device_type.lower() else "SSH"
-            
-            log_message(f"Attempting to connect to {ip_address} via {protocol} with credential set {i + 1}...")
-            
-            connect_params = {
-                'device_type': device_type,
-                'host': ip_address,
-                'username': username,
-                'password': password,
-                'timeout': 60,
-                'global_delay_factor': 2,
-                'fast_cli': False
-            }
-
-            try:
-                net_connect = ConnectHandler(**connect_params)
-            except NetmikoAuthenticationException:
-                log_message(f"Authentication failed for {ip_address}.")
-                consecutive_auth_failures += 1
-                continue
-            except NetmikoTimeoutException:
-                log_message(f"Connection timed out to {ip_address}.")
-                consecutive_auth_failures += 1
-                continue
-            except Exception as e:
-                log_message(f"An unexpected error occurred for {ip_address}: {e}")
-                consecutive_auth_failures += 1
-                continue
-                
+        try:
+            net_connect = ConnectHandler(**connect_params)
             log_message(f"Connection successful to {ip_address} via {protocol} with credential set {i + 1}.")
             return net_connect, "Success", cred
-        
-    if net_connect:
-        net_connect.disconnect()
-    return None, "Authentication Failed", None
+        except NetmikoAuthenticationException:
+            log_message(f"Authentication failed for {ip_address}.")
+            continue
+        except NetmikoTimeoutException:
+            log_message(f"Connection timed out to {ip_address}. Skipping remaining credentials for this protocol.")
+            return None, "Connection timed out", None
+        except Exception as e:
+            error_message = str(e)
+            if "[WinError 10061]" in error_message or "Connection refused" in error_message:
+                log_message(f"Connection refused to {ip_address}. Skipping remaining credentials for this protocol.")
+                return None, "Connection refused", None
+            else:
+                log_message(f"An unexpected error occurred for {ip_address}: {e}. Retrying with next credential...")
+                continue
+    
+    # This part is reached only if all credentials in the list have been tried.
+    return None, "All credentials failed to connect", None
 
 def create_combined_excel_report(cdp_data, inventory_data, filename):
     """
@@ -238,64 +224,56 @@ def get_cdp_neighbors(ip_address, ip_specific_creds, network_specific_creds, oth
     if ip_address in ip_specific_creds:
         log_message(f"Prioritizing IP-specific credentials for {ip_address}.")
         creds_to_try.extend(ip_specific_creds[ip_address])
-        creds_to_try.extend(other_creds)
-    # Rule 2: Network-Specific Credentials
+    
+    # Rule 2: Network-Specific Credentials (Iterate through all matching networks)
     else:
         found_network_match = False
         try:
             ip_obj = ipaddress.ip_address(ip_address)
             for network, creds in network_specific_creds.items():
-                network_obj = ipaddress.ip_network(network)
+                network_obj = ipaddress.ip_network(network, strict=False)
                 if ip_obj in network_obj:
-                    log_message(f"Prioritizing network-specific credentials for {ip_address} from {network}.")
+                    log_message(f"Prioritizing credentials from network {network} for {ip_address}.")
                     creds_to_try.extend(creds)
-                    creds_to_try.extend(other_creds)
                     found_network_match = True
-                    break
-        except ValueError:
-            log_message(f"Invalid network notation found in Creds.txt.")
+        except ValueError as e:
+            log_message(f"Invalid network notation in Creds.txt: {e}")
+
+        if found_network_match:
+            creds_to_try.extend(other_creds)
         
-        # Rule 3: Use remaining credentials
-        if not found_network_match:
+        if not creds_to_try:
             log_message(f"No specific credentials found for {ip_address}. Using general credentials.")
             creds_to_try.extend(other_creds)
 
+    # First, try to connect via SSH
     net_connect, status, used_creds = reconnect_and_retry(ip_address, creds_to_try, 'cisco_ios', cached_creds)
+
+    # If SSH fails due to timeout or connection issue, try Telnet
+    if status != "Success" and ("timeout" in status.lower() or "refused" in status.lower()):
+        log_message(f"Connection failed via SSH for {ip_address}. Now trying Telnet...")
+        net_connect, status, used_creds = reconnect_and_retry(ip_address, creds_to_try, 'cisco_ios_telnet', cached_creds)
+        if status == "Success":
+            status = "Success via Telnet"
+
     output = None
-    if status == "Success":
+    if status.startswith("Success"):
         try:
             output = net_connect.send_command('show cdp neighbor detail', delay_factor=2)
-            return output, "Success", used_creds, net_connect, 'cisco_ios'
+            return output, status, used_creds, net_connect, net_connect.device_type
         except ReadTimeout as e:
             log_message(f"ReadTimeout on {ip_address}: {e}")
-            net_connect.disconnect()
+            if net_connect and net_connect.is_alive():
+                net_connect.disconnect()
             return None, "Read Timeout", None, None, None
         except Exception as e:
             log_message(f"Error sending command to {ip_address}: {e}")
-            net_connect.disconnect()
+            if net_connect and net_connect.is_alive():
+                net_connect.disconnect()
             return None, "Command Error", None, None, None
-    
-    if "Authentication Failed" in status:
-        log_message(f"SSH authentication failed for {ip_address}. Skipping Telnet attempt.")
-        return None, f"Failed: {status}", None, None, None
-
-    if "Connection" in status or "Timeout" in status or "Unexpected" in status:
-        net_connect, telnet_status, used_creds = reconnect_and_retry(ip_address, creds_to_try, 'cisco_ios_telnet', cached_creds)
-        if telnet_status == "Success":
-            try:
-                output = net_connect.send_command('show cdp neighbor detail', delay_factor=2)
-                return output, "Success via Telnet", used_creds, net_connect, 'cisco_ios_telnet'
-            except ReadTimeout as e:
-                log_message(f"ReadTimeout on {ip_address} via Telnet: {e}")
-                net_connect.disconnect()
-                return None, "Read Timeout via Telnet", None, None, None
-            except Exception as e:
-                log_message(f"Error sending command to {ip_address} via Telnet: {e}")
-                net_connect.disconnect()
-                return None, "Command Error via Telnet", None, None, None
-        return None, f"Failed via SSH ({status}) and Telnet ({telnet_status})", None, None, None
-
-    return None, f"Failed: {status}", None, None, None
+    else:
+        # Pass the detailed error status directly to the report.
+        return None, status, None, None, None
 
 def parse_cdp_output(output, parent_ip, connection_result, found_via):
     """
@@ -415,20 +393,25 @@ def get_inventory_from_device(host, credential, cached_protocol):
     }
     net_connect = None
     
-    try:
-        net_connect, status, _ = reconnect_and_retry(host, [], cached_protocol, credential, is_inventory_stage=True)
-        if status != "Success":
-            if cached_protocol == 'cisco_ios':
-                alt_protocol = 'cisco_ios_telnet'
-            else:
-                alt_protocol = 'cisco_ios'
-            
-            log_message(f"Cached protocol ({cached_protocol.upper()}) failed for {host}. Trying {alt_protocol.upper()}...")
-            net_connect, status, _ = reconnect_and_retry(host, [], alt_protocol, credential, is_inventory_stage=True)
-            if status != "Success":
-                base_result['error'] = f"Failed to connect via both protocols: {status}"
-                return [{**base_result, 'product_id': 'N/A', 'serial_number': 'N/A', 'hostname': 'N/A'}]
+    # First, try to connect using the cached protocol
+    net_connect, status, _ = reconnect_and_retry(host, [], cached_protocol, credential)
     
+    # If the first attempt fails, try the alternative protocol
+    if status != "Success":
+        if cached_protocol == 'cisco_ios':
+            alt_protocol = 'cisco_ios_telnet'
+        else:
+            alt_protocol = 'cisco_ios'
+        
+        log_message(f"Cached protocol ({cached_protocol.upper()}) failed for {host}. Trying {alt_protocol.upper()}...")
+        # REMOVE 'is_inventory_stage=True' from this line
+        net_connect, status, _ = reconnect_and_retry(host, [], alt_protocol, credential)
+        
+    if status != "Success":
+        base_result['error'] = f"Failed to connect via both protocols: {status}"
+        return [{**base_result, 'product_id': 'N/A', 'serial_number': 'N/A', 'hostname': 'N/A'}]
+    
+    try:
         platform_output = net_connect.send_command("show version | include Platform", delay_factor=2).strip()
         device_type = 'cisco_ios'
         if 'N3K' in platform_output or 'N9K' in platform_output:
@@ -436,7 +419,8 @@ def get_inventory_from_device(host, credential, cached_protocol):
             
         if net_connect.device_type != device_type:
             net_connect.disconnect()
-            net_connect, status, _ = reconnect_and_retry(host, [], device_type, credential, is_inventory_stage=True)
+            # REMOVE 'is_inventory_stage=True' from this line
+            net_connect, status, _ = reconnect_and_retry(host, [], device_type, credential)
             if status != "Success":
                 base_result['error'] = f"Failed to reconnect with correct type: {status}"
                 return [{**base_result, 'product_id': 'N/A', 'serial_number': 'N/A', 'hostname': 'N/A'}]
